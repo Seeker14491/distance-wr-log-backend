@@ -1,0 +1,2 @@
+[workspace]
+members = ["distance-wr-log-bot", "distance-wr-log-manager"]
