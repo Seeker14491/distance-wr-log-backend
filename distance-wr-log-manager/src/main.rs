@@ -134,7 +134,7 @@ fn start_steam() -> Result<Child, Error> {
     }
 
     let child = command
-        .args(["-no-browser", "-nofriendsui"])
+        .args(["-noreactlogin", "-no-browser", "-nofriendsui"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
