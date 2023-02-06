@@ -5,19 +5,18 @@
     unused_qualifications
 )]
 
-use anyhow::{format_err, Context, Error};
+use anyhow::{format_err, Context, Error, Result};
 use futures::pin_mut;
 use log::{error, info, warn};
 use std::fmt::Display;
-use std::process::{ExitStatus, Stdio};
+use std::process::ExitStatus;
 use std::time::{Duration, Instant};
 use std::{env, process};
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::time;
 
 const UPDATE_PERIOD: Duration = Duration::from_secs(5 * 60);
 const MAX_UPDATE_DURATION: Duration = Duration::from_secs(60 * 60);
-const STEAM_RESTART_PERIOD: Duration = Duration::from_secs(3 * 3600);
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
@@ -44,7 +43,7 @@ async fn main() {
 
     if let Err(e) = result {
         if let Some(url) = healthchecks_url {
-            healthchecks_send_fail_signal(&url, &format!("error: {}", e))
+            healthchecks_send_fail_signal(&url, &format!("error: {e}"))
                 .await
                 .expect("Couldn't send healthchecks fail signal");
         }
@@ -63,97 +62,32 @@ fn print_error<E: Into<Error>>(e: E) {
     }
 }
 
-async fn run(healthchecks_url: Option<&str>) -> Result<(), Error> {
-    let mut consecutive_update_failures = 0;
-
+async fn run(healthchecks_url: Option<&str>) -> Result<()> {
     loop {
-        let mut steam = start_steam()?;
-        sleep_secs(60).await;
-
-        let steam_start_time = Instant::now();
-        while steam_start_time.elapsed() < STEAM_RESTART_PERIOD {
-            let update_start_time = Instant::now();
-            let f = run_distance_log();
-            pin_mut!(f);
-            match time::timeout(MAX_UPDATE_DURATION, f).await {
-                Ok(_) => {
-                    if let Some(url) = healthchecks_url {
-                        healthchecks_send_ping(url).await.ok();
-                    }
-
-                    time::sleep(
-                        UPDATE_PERIOD
-                            .checked_sub(update_start_time.elapsed())
-                            .unwrap_or_default(),
-                    )
-                    .await;
-
-                    consecutive_update_failures = 0;
+        let update_start_time = Instant::now();
+        let f = run_distance_log();
+        pin_mut!(f);
+        match time::timeout(MAX_UPDATE_DURATION, f).await {
+            Ok(_) => {
+                if let Some(url) = healthchecks_url {
+                    healthchecks_send_ping(url).await.ok();
                 }
-                Err(_) => {
-                    print_error(format_err!("distance-wr-log-bot ran for too long"));
 
-                    if consecutive_update_failures != 0 {
-                        let i = consecutive_update_failures % 3;
-                        if i == 0 {
-                            break;
-                        } else {
-                            sleep_secs(5 * 60).await;
-                        }
-                    }
-
-                    consecutive_update_failures += 1;
-                }
+                time::sleep(
+                    UPDATE_PERIOD
+                        .checked_sub(update_start_time.elapsed())
+                        .unwrap_or_default(),
+                )
+                .await;
+            }
+            Err(_) => {
+                print_error(format_err!("distance-wr-log-bot ran for too long"));
             }
         }
-
-        shutdown_steam().await?;
-        steam.wait().await?;
     }
 }
 
-async fn sleep_secs(secs: u64) {
-    time::sleep(Duration::from_secs(secs)).await;
-}
-
-fn start_steam() -> Result<Child, Error> {
-    info!("Starting Steam");
-
-    let steam_user = env::var("STEAM_USERNAME");
-    let steam_pass = env::var("STEAM_PASSWORD");
-
-    let mut command = Command::new("steam");
-    match (steam_user, steam_pass) {
-        (Ok(user), Ok(pass)) => {
-            command.args(["-login", &user, &pass]);
-        }
-        (Ok(user), _) => {
-            command.args(["-login", &user]);
-        }
-        _ => {}
-    }
-
-    let child = command
-        .args(["-noreactlogin", "-no-browser", "-nofriendsui"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("Couldn't spawn Steam process")?;
-
-    Ok(child)
-}
-
-async fn shutdown_steam() -> Result<ExitStatus, Error> {
-    info!("Shutting down Steam");
-    Command::new("steam")
-        .arg("-shutdown")
-        .status()
-        .await
-        .context("Error shutting down Steam")
-}
-
-async fn run_distance_log() -> Result<ExitStatus, Error> {
+async fn run_distance_log() -> Result<ExitStatus> {
     info!("Starting distance-wr-log-bot");
     let mut child = Command::new("./distance-wr-log-bot")
         .spawn()
@@ -162,11 +96,14 @@ async fn run_distance_log() -> Result<ExitStatus, Error> {
     Ok(child.wait().await?)
 }
 
-async fn healthchecks_send_ping(healthchecks_url: &str) -> Result<(), Error> {
-    surf::get(healthchecks_url)
-        .send()
+async fn healthchecks_send_ping(healthchecks_url: &str) -> Result<()> {
+    let err_msg = "error sending fail signal";
+
+    reqwest::get(healthchecks_url)
         .await
-        .map_err(|e| format_err!("Error sending fail signal: {}", e))?;
+        .context(err_msg)?
+        .error_for_status()
+        .context(err_msg)?;
 
     Ok(())
 }
@@ -175,8 +112,10 @@ async fn healthchecks_send_fail_signal(
     healthchecks_url: &str,
     error: impl Display,
 ) -> Result<(), Error> {
-    surf::post(format!("{}/fail", healthchecks_url))
-        .body(format!("[Distance Steamworks Manager] error: {}", error))
+    let client = reqwest::Client::new();
+    client
+        .post(format!("{healthchecks_url}/fail"))
+        .body(format!("[manager] error: {error}"))
         .send()
         .await
         .map_err(|e| format_err!("Error sending fail signal: {}", e))?;

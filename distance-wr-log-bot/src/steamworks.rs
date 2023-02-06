@@ -1,9 +1,7 @@
 use anyhow::Result;
-use futures::{future, Stream, TryStreamExt};
+use futures::{pin_mut, Stream, TryStreamExt};
+use itertools::Itertools;
 use serde_derive::{Deserialize, Serialize};
-use steamworks::ugc::MatchingUgcType;
-use steamworks::{Client, InitError};
-use tap::Pipe;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardResponse {
@@ -15,7 +13,7 @@ pub struct LeaderboardEntry {
     pub steam_id: u64,
     pub global_rank: i32,
     pub score: i32,
-    pub player_name: String,
+    pub player_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,41 +24,48 @@ pub struct WorkshopResponse {
     pub title: String,
     pub score: f32,
     pub tags: Box<[String]>,
-    pub author_name: String,
+    pub author_name: Option<String>,
     pub preview_url: String,
 }
 
 #[derive(Debug, Clone)]
-pub struct Steamworks(Client);
+pub struct Steamworks {
+    grpc_client: distance_steam_data_client::Client,
+    web_client: reqwest::Client,
+    web_api_key: String,
+}
 
 impl Steamworks {
-    pub fn new() -> Result<Self, InitError> {
-        Ok(Steamworks(Client::init(Some(233610))?))
+    pub async fn new(
+        grpc_address: impl Into<String>,
+        web_api_key: impl Into<String>,
+    ) -> Result<Self> {
+        Ok(Steamworks {
+            grpc_client: distance_steam_data_client::Client::connect(grpc_address.into()).await?,
+            web_client: reqwest::Client::new(),
+            web_api_key: web_api_key.into(),
+        })
     }
 
     pub async fn get_leaderboard_range(
         &self,
-        leaderboard_name: String,
-        start: u32,
-        end: u32,
+        leaderboard_name: &str,
+        start: i32,
+        end: i32,
     ) -> Result<LeaderboardResponse> {
-        let leaderboard = self.0.find_leaderboard(leaderboard_name.clone()).await?;
-        let entries = leaderboard
-            .download_global(start, end, 0)
-            .await
+        let entries = self
+            .grpc_client
+            .leaderboard_entries_range(leaderboard_name, start, end)
+            .await?
+            .entries
             .into_iter()
-            .map(|entry| async move {
-                let player_name = entry.steam_id.persona_name(&self.0).await;
-
-                LeaderboardEntry {
-                    steam_id: entry.steam_id.into(),
-                    global_rank: entry.global_rank,
-                    score: entry.score,
-                    player_name,
-                }
+            .map(|entry| LeaderboardEntry {
+                steam_id: entry.steam_id,
+                global_rank: entry.global_rank,
+                score: entry.score,
+                player_name: None,
             })
-            .pipe(future::join_all)
-            .await
+            .collect_vec()
             .into_boxed_slice();
 
         Ok(LeaderboardResponse { entries })
@@ -69,29 +74,44 @@ impl Steamworks {
     pub fn get_all_workshop_sprint_challenge_stunt_levels(
         &self,
     ) -> impl Stream<Item = Result<WorkshopResponse>> + '_ {
-        self.0
-            .query_all_ugc(MatchingUgcType::ItemsReadyToUse)
-            .match_any_tags()
-            .required_tags(["Sprint", "Challenge", "Stunt"].iter().copied())
-            .run()
-            .try_filter(|details| future::ready(!details.file_name.is_empty()))
-            .map_ok(move |details| {
-                let tags: Vec<_> = details.tags.iter().map(|s| s.to_owned()).collect();
-                async move {
-                    let author_name = details.steam_id_owner.persona_name(&self.0).await;
-                    Ok(WorkshopResponse {
-                        published_file_id: details.published_file_id.into(),
-                        steam_id_owner: details.steam_id_owner.into(),
-                        file_name: details.file_name,
+        ez_stream::try_unbounded(move |tx| async move {
+            let stream = steam_workshop::query_all_files(
+                self.web_client.clone(),
+                self.web_api_key.clone(),
+                233610,
+            );
+            pin_mut!(stream);
+            while let Some(chunk) = stream.try_next().await? {
+                for details in chunk {
+                    let is_relevant_level = details
+                        .tags
+                        .iter()
+                        .any(|tag| ["Sprint", "Challenge", "Stunt"].contains(&tag.tag.as_str()));
+                    if !is_relevant_level || details.filename.is_empty() {
+                        continue;
+                    }
+
+                    tx.send(WorkshopResponse {
+                        published_file_id: details.published_file_id,
+                        steam_id_owner: details.creator,
+                        file_name: details.filename,
                         title: details.title,
-                        score: details.score,
-                        tags: tags.into_boxed_slice(),
-                        author_name,
+                        score: details.vote_data.score,
+                        tags: details.tags.into_iter().map(|tag| tag.tag).collect(),
+                        author_name: None,
                         preview_url: details.preview_url,
-                    })
+                    })?;
                 }
-            })
-            .try_buffer_unordered(usize::MAX)
-            .err_into()
+            }
+
+            Ok(())
+        })
+    }
+
+    pub async fn resolve_steam_names(
+        &self,
+        steam_ids: Vec<u64>,
+    ) -> Result<impl Iterator<Item = Option<String>>> {
+        self.grpc_client.persona_names(steam_ids).await
     }
 }

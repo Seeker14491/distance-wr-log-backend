@@ -16,7 +16,9 @@ use if_chain::if_chain;
 use indicatif::ProgressBar;
 use itertools::{EitherOrBoth, Itertools};
 use log::{info, warn};
-use std::collections::BTreeMap;
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
+use std::env;
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
@@ -34,7 +36,12 @@ const CHANGELIST_PATH: &str = "/data/changelist.json";
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let steamworks = Steamworks::new()?;
+    let grpc_address = env::var("GRPC_SERVER_ADDRESS")
+        .expect("environment variable GRPC_SERVER_ADDRESS is not set");
+    let steam_web_api_key =
+        env::var("STEAM_WEB_API_KEY").expect("environment variable STEAM_WEB_API_KEY is not set");
+
+    let steamworks = Steamworks::new(grpc_address, steam_web_api_key).await?;
     let persistence = FileJsonPersistence::new(QUERY_RESULTS_PATH, CHANGELIST_PATH);
 
     info!("Starting update procedure");
@@ -86,6 +93,10 @@ async fn update(steamworks: &Steamworks, persistence: &FileJsonPersistence) -> R
         .await?;
     spinner.finish_with_message("Finished fetching level information.");
 
+    info!("Resolving player and author names...");
+    resolve_player_and_author_names(steamworks, &mut new_level_infos).await?;
+    info!("Finished resolving player and author names");
+
     // Deal with Steam sometimes failing to return data by supplementing it with the previously stored
     // data.
     if let Some(ref old) = old_level_infos {
@@ -107,7 +118,7 @@ async fn update(steamworks: &Steamworks, persistence: &FileJsonPersistence) -> R
 }
 
 fn get_level_infos(steamworks: &Steamworks) -> impl Stream<Item = Result<LevelInfo>> + '_ {
-    const MAX_BUFFER: usize = 512;
+    const MAX_BUFFER: usize = 64;
     const TIMEOUT: Duration = Duration::from_secs(60);
 
     let official_levels = get_official_levels(steamworks)
@@ -129,6 +140,56 @@ fn get_level_infos(steamworks: &Steamworks) -> impl Stream<Item = Result<LevelIn
             })
             .map(|timeout_result| timeout_result.unwrap())
     })
+}
+
+async fn resolve_player_and_author_names(
+    steamworks: &Steamworks,
+    level_infos: &mut [LevelInfo],
+) -> Result<()> {
+    let author_ids = level_infos
+        .iter()
+        .filter_map(|level| level.workshop_response.as_ref())
+        .map(|workshop| workshop.steam_id_owner);
+
+    let player_ids = level_infos
+        .iter()
+        .flat_map(|level| level.leaderboard_response.entries.iter())
+        .map(|entry| entry.steam_id);
+
+    let id_to_name_map: HashMap<u64, Cell<Option<String>>> = author_ids
+        .chain(player_ids)
+        .map(|id| (id, Cell::new(None)))
+        .collect();
+    for chunk in &id_to_name_map.keys().chunks(4_096) {
+        let (chunk_1, chunk_2) = chunk.tee();
+        let names = steamworks
+            .resolve_steam_names(chunk_1.copied().collect())
+            .await?;
+
+        for (id, name) in chunk_2.zip(names) {
+            id_to_name_map.get(id).unwrap().set(name);
+        }
+    }
+
+    level_infos
+        .iter_mut()
+        .filter_map(|level| level.workshop_response.as_mut())
+        .for_each(|workshop| {
+            let cell = id_to_name_map.get(&workshop.steam_id_owner).unwrap();
+            workshop.author_name = Some(cell.take().unwrap_or_else(|| "[unknown]".into()));
+            cell.set(workshop.author_name.clone());
+        });
+
+    level_infos
+        .iter_mut()
+        .flat_map(|level| level.leaderboard_response.entries.iter_mut())
+        .for_each(|entry| {
+            let cell = id_to_name_map.get(&entry.steam_id).unwrap();
+            entry.player_name = Some(cell.take().unwrap_or_else(|| "[unknown]".into()));
+            cell.set(entry.player_name.clone());
+        });
+
+    Ok(())
 }
 
 fn add_missing_entries_from(mut new: Vec<LevelInfo>, mut old: Vec<LevelInfo>) -> Vec<LevelInfo> {
@@ -165,14 +226,13 @@ fn get_official_levels(
         )
         .unwrap_or_else(|| {
             panic!(
-                "Couldn't create a leaderboard name string for the official level '{}'",
-                level_name
+                "Couldn't create a leaderboard name string for the official level '{level_name}'"
             )
         });
 
         async move {
             let leaderboard_response = steamworks
-                .get_leaderboard_range(leaderboard_name.clone(), 1, 2)
+                .get_leaderboard_range(&leaderboard_name, 1, 2)
                 .await?;
 
             Ok(LevelInfo {
@@ -221,7 +281,7 @@ fn get_workshop_levels(
     level_infos.map(|x: Result<_>| async {
         let (workshop_response, mode, leaderboard_name) = x?;
         steamworks
-            .get_leaderboard_range(leaderboard_name.clone(), 1, 2)
+            .get_leaderboard_range(&leaderboard_name, 1, 2)
             .await
             .ok()
             .map(|leaderboard_response| LevelInfo {
@@ -273,7 +333,7 @@ fn update_changelist(
             if let Some(previous_first_entry) = level_info_old.leaderboard_response.entries.get(0);
             then {
                 if is_score_better(first_entry.score, previous_first_entry.score, *mode) {
-                    (Some(previous_first_entry.player_name.clone()),
+                    (Some(previous_first_entry.player_name.as_ref().unwrap().clone()),
                         Some(distance_util::format_score(previous_first_entry.score, *mode).unwrap()),
                         Some(format!("{}", previous_first_entry.steam_id)))
                 } else {
@@ -286,10 +346,10 @@ fn update_changelist(
 
         Some(ChangelistEntry {
             map_name: name.clone(),
-            map_author: workshop_response.as_ref().map(|x| x.author_name.clone()),
+            map_author: workshop_response.as_ref().map(|x| x.author_name.as_ref().unwrap().clone()),
             map_preview: workshop_response.as_ref().map(|x| x.preview_url.clone()),
-            mode: format!("{}", mode),
-            new_recordholder: first_entry.player_name,
+            mode: format!("{mode}"),
+            new_recordholder: first_entry.player_name.unwrap(),
             old_recordholder,
             record_new: distance_util::format_score(first_entry.score, *mode).unwrap(),
             record_old,
