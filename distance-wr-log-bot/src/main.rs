@@ -118,7 +118,7 @@ async fn update(steamworks: &Steamworks, persistence: &FileJsonPersistence) -> R
 }
 
 fn get_level_infos(steamworks: &Steamworks) -> impl Stream<Item = Result<LevelInfo>> + '_ {
-    const MAX_BUFFER: usize = 64;
+    const MAX_BUFFER: usize = 4;
     const TIMEOUT: Duration = Duration::from_secs(60);
 
     let official_levels = get_official_levels(steamworks)
