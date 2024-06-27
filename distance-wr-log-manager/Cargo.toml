@@ -6,9 +6,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-color-backtrace = "0.5"
-env_logger = "0.10"
+color-backtrace = "0.6"
+env_logger = "0.11"
 futures = "0.3"
 log = "0.4"
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"]}
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+] }
 tokio = { version = "1", features = ["macros", "process", "rt", "time"] }

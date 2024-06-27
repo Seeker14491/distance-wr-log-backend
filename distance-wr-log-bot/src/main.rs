@@ -224,7 +224,7 @@ fn get_official_levels(
         let leaderboard_name = distance_util::create_leaderboard_name_string(
             level_name, mode, None,
         )
-        .unwrap_or_else(|| {
+        .unwrap_or_else(|_| {
             panic!(
                 "Couldn't create a leaderboard name string for the official level '{level_name}'"
             )
@@ -271,6 +271,7 @@ fn get_workshop_levels(
                     *mode,
                     Some(workshop_response.steam_id_owner),
                 )
+                .ok()
                 .map(|leaderboard_name| (workshop_response.clone(), *mode, leaderboard_name))
             })
             .map(Ok)
@@ -322,7 +323,7 @@ fn update_changelist(
             leaderboard_response,
             timestamp,
         } = level_info;
-        let first_entry = if let Some(x) = leaderboard_response.entries.get(0) {
+        let first_entry = if let Some(x) = leaderboard_response.entries.first() {
             x.clone()
         } else {
             return None;
@@ -330,11 +331,11 @@ fn update_changelist(
 
         let (old_recordholder, record_old, steam_id_old_recordholder) = if_chain! {
             if let Some(level_info_old) = old.get(leaderboard_name);
-            if let Some(previous_first_entry) = level_info_old.leaderboard_response.entries.get(0);
+            if let Some(previous_first_entry) = level_info_old.leaderboard_response.entries.first();
             then {
                 if is_score_better(first_entry.score, previous_first_entry.score, *mode) {
                     (Some(previous_first_entry.player_name.as_ref().unwrap().clone()),
-                        Some(distance_util::format_score(previous_first_entry.score, *mode).unwrap()),
+                        Some(distance_util::format_score_legacy(previous_first_entry.score, *mode).unwrap()),
                         Some(format!("{}", previous_first_entry.steam_id)))
                 } else {
                     return None;
@@ -351,7 +352,7 @@ fn update_changelist(
             mode: format!("{mode}"),
             new_recordholder: first_entry.player_name.unwrap(),
             old_recordholder,
-            record_new: distance_util::format_score(first_entry.score, *mode).unwrap(),
+            record_new: distance_util::format_score_legacy(first_entry.score, *mode).unwrap(),
             record_old,
             workshop_item_id: workshop_response
                 .as_ref()

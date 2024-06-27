@@ -8,21 +8,24 @@ edition = "2021"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 distance-steam-data-client = { git = "https://github.com/Seeker14491/DistanceSteamDataServer.git" }
-# Still using v0.1 because time formatting changed in v0.2
-distance-util = { git = "https://github.com/Seeker14491/distance-util.git", tag = "v0.1.0", features = ["serde"] }
-env_logger = "0.10"
+distance-util = { git = "https://github.com/Seeker14491/distance-util.git", tag = "v0.3.1", features = [
+  "serde",
+] }
+env_logger = "0.11"
 ez-stream = { git = "https://github.com/Seeker14491/ez-stream.git" }
 futures = "0.3"
 humantime = "2"
 if_chain = "1"
 indicatif = "0.17"
-itertools = "0.10"
+itertools = "0.13"
 log = "0.4"
-reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"]}
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+] }
 serde = "1"
 serde_derive = "1"
 serde_json = "1"
-steam-workshop = { git = "https://github.com/Seeker14491/steam-workshop.git" }
+steam-workshop = { git = "https://github.com/Seeker14491/steam-workshop.git", rev = "4c90314496bce2f4b6048268544603b622ea2bf8" }
 tap = "1"
 tempfile = "3"
 thiserror = "1"
