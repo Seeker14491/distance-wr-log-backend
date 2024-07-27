@@ -6,6 +6,8 @@
 )]
 
 use anyhow::{format_err, Context, Error, Result};
+use backoff::backoff::Backoff;
+use backoff::ExponentialBackoff;
 use futures::pin_mut;
 use log::{error, info, warn};
 use std::fmt::Display;
@@ -63,12 +65,16 @@ fn print_error<E: Into<Error>>(e: E) {
 }
 
 async fn run(healthchecks_url: Option<&str>) -> Result<()> {
+    let mut backoff = ExponentialBackoff {
+        max_elapsed_time: None,
+        ..Default::default()
+    };
     loop {
         let update_start_time = Instant::now();
         let f = run_distance_log();
         pin_mut!(f);
         match time::timeout(MAX_UPDATE_DURATION, f).await {
-            Ok(_) => {
+            Ok(Ok(exit_status)) if exit_status.success() => {
                 if let Some(url) = healthchecks_url {
                     healthchecks_send_ping(url).await.ok();
                 }
@@ -79,9 +85,15 @@ async fn run(healthchecks_url: Option<&str>) -> Result<()> {
                         .unwrap_or_default(),
                 )
                 .await;
+                backoff.reset();
+            }
+            Ok(_) => {
+                print_error(format_err!("distance-wr-log-bot did not run successfully"));
+                time::sleep(backoff.next_backoff().unwrap()).await;
             }
             Err(_) => {
                 print_error(format_err!("distance-wr-log-bot ran for too long"));
+                backoff.reset();
             }
         }
     }
